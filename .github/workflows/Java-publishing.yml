@@ -1,0 +1,196 @@
+name: Java 📦 Distribution
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    paths-ignore:
+      - ".gitignore"
+      - "docs/**"
+      - "README"
+      - "CREDITS.TXT"
+      - "COPYING_GLIB"
+      - "COPYING.LGPL2"
+      - "AUTHORS.TXT"
+      - "CHANGELOG"
+      - "COPYING"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.config.os }}
+    name: ${{ matrix.config.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {
+            os: windows-2022,
+            name: 'windows-x64 JNI',
+            artifact: 'unicorn-java-windows-x64',
+            archive: 'zip',
+            libext: 'dll'
+          }
+          - {
+            os: ubuntu-latest,
+            name: 'ubuntu-x64 JNI',
+            artifact: 'unicorn-java-linux-x64',
+            archive: 'tar.gz',
+            libext: 'so'
+          }
+          - {
+            os: ubuntu-24.04-arm,
+            name: 'ubuntu-arm64 JNI',
+            artifact: 'unicorn-java-linux-arm64',
+            archive: 'tar.gz',
+            libext: 'so'
+          }
+          - {
+            os: macos-13,
+            name: 'macos-x64 JNI',
+            artifact: 'unicorn-java-macos-x64',
+            archive: 'tar.gz',
+            libext: 'dylib'
+          }
+          - {
+            os: macos-14,
+            name: 'macos-arm64 JNI',
+            artifact: 'unicorn-java-macos-arm64',
+            archive: 'tar.gz',
+            libext: 'dylib'
+          }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🛠️ Set up Java"
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: bindings/java/pom.xml
+
+      - name: "🛠️ Set up CMake"
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: latest
+          ninjaVersion: latest
+
+      - name: "🛠️ Linux build dependencies"
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -q -y
+          sudo apt-get install -q -y build-essential python3
+
+      # The JNI library is compiled and linked by the bindings Makefile, which
+      # hardcodes `gcc`, so MinGW is used instead of MSVC on Windows. The core
+      # library must therefore be built with the very same toolchain, otherwise
+      # libunicorn.a could not be linked against it.
+      - name: "🛠️ Win MinGW (MINGW64) toolchain"
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-python
+
+      # Git Bash has no make/python3, and the MSYS2 toolchain is not on PATH for
+      # non-MSYS2 shells. mvn calls `python3` and `make`, so expose both here.
+      - name: "🛠️ Expose MinGW tools on PATH"
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "C:/msys64/mingw64/bin" >> "$GITHUB_PATH"
+          if ! command -v python3 >/dev/null 2>&1; then
+            mkdir -p "$HOME/bin"
+            printf '#!/bin/sh\nexec python "$@"\n' > "$HOME/bin/python3"
+            chmod +x "$HOME/bin/python3"
+            echo "$HOME/bin" >> "$GITHUB_PATH"
+          fi
+
+      # Only the bundled static archive is needed: the JNI library links it in
+      # statically, so the result has no runtime dependency on libunicorn.
+      - name: "🚧 Build libunicorn.a"
+        shell: bash
+        run: |
+          cmake \
+            -S . \
+            -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=off \
+            -DUNICORN_LEGACY_STATIC_ARCHIVE=on \
+            -DUNICORN_BUILD_TESTS=off
+          cmake --build build --config Release --target unicorn_archive
+          ls -la build/libunicorn.a
+
+      # The JNI build is driven by an exec-maven-plugin execution bound to the
+      # compile phase, which needs the JNI headers that javac -h only emits while
+      # compiling. It is therefore driven manually below (see -Dexec.skip=true).
+      - name: "🚧 Generate Java constants"
+        working-directory: bindings
+        shell: bash
+        run: python3 const_generator.py java
+
+      - name: "🚧 Compile Java classes & JNI headers"
+        working-directory: bindings/java
+        shell: bash
+        run: mvn -B -e compile -Dexec.skip=true
+
+      - name: "🚧 Build JNI library"
+        working-directory: bindings/java
+        shell: bash
+        run: |
+          make JAVA_HOME="${JAVA_HOME//\\//}" all
+          ls -la libunicorn_java.${{ matrix.config.libext }}
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # MinGW prefixes the output with `lib`, but System.loadLibrary()
+            # looks for plain unicorn_java.dll on Windows.
+            cp libunicorn_java.dll unicorn_java.dll
+          fi
+
+      - name: "🚧 Package & run tests"
+        working-directory: bindings/java
+        shell: bash
+        run: |
+          # `pwd -W` yields a Windows path, which the JVM needs to resolve
+          # System.loadLibrary() on Windows.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            LIB_PATH="$(pwd -W)"
+          else
+            LIB_PATH="$(pwd)"
+          fi
+          mvn -B -e package -Dexec.skip=true -DargLine="-Djava.library.path=$LIB_PATH"
+
+      - name: "📦 Pack artifact"
+        shell: bash
+        run: |
+          STAGE="bindings/java/target/javadist/${{ matrix.config.artifact }}"
+          mkdir -p "$STAGE"
+          cp bindings/java/target/unicorn-*.jar "$STAGE/"
+          cp bindings/java/libunicorn_java.${{ matrix.config.libext }} "$STAGE/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp bindings/java/unicorn_java.dll "$STAGE/"
+          fi
+          find "$STAGE" -type f
+          cd bindings/java/target/javadist
+          if [ "${{ matrix.config.archive }}" = "zip" ]; then
+            7z a "../${{ matrix.config.artifact }}.zip" "${{ matrix.config.artifact }}"
+          else
+            tar -czf "../${{ matrix.config.artifact }}.tar.gz" "${{ matrix.config.artifact }}"
+          fi
+
+      - name: "📤 Upload artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.config.artifact }}
+          path: ./bindings/java/target/${{ matrix.config.artifact }}.*
+          if-no-files-found: error
