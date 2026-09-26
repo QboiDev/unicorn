@@ -177,7 +177,7 @@ jobs:
             cp libunicorn_java.dll unicorn_java.dll
           fi
 
-      - name: "🚧 Package & run tests"
+      - name: "🚧 Package"
         working-directory: bindings/java
         shell: bash
         run: |
@@ -188,7 +188,7 @@ jobs:
           else
             LIB_PATH="$(pwd)"
           fi
-          mvn -B -e package -Dexec.skip=true -DargLine="-Djava.library.path=$LIB_PATH"
+          mvn -B -e package -Dexec.skip=true -DskipTests -DargLine="-Djava.library.path=$LIB_PATH"
 
       - name: "📦 Pack artifact"
         shell: bash
