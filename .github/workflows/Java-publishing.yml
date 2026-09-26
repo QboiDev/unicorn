@@ -145,6 +145,26 @@ jobs:
         shell: bash
         run: mvn -B -e compile -Dexec.skip=true
 
+      # bindings/java/unicorn_Unicorn.c:763 dereferences the jlong returned by
+      # GetArrayLength (`arr, *size` instead of `arr, size`), which is a hard
+      # compile error on every toolchain. The sibling _mem_write uses the value
+      # directly. No-ops once the source is fixed upstream, and fails loudly if
+      # the code changes shape so this step is revisited.
+      - name: "🔧 Fix JNI _mem_read size dereference"
+        shell: bash
+        run: |
+          SRC=bindings/java/unicorn_Unicorn.c
+          if grep -qF 'uc_mem_read((uc_engine *)uc, address, arr, *size)' "$SRC"; then
+            # No -i flag: portable across GNU and BSD sed alike.
+            sed 's/arr, [*]size/arr, size/' "$SRC" > "$SRC.tmp" && mv "$SRC.tmp" "$SRC"
+            echo "patched $SRC"
+          elif grep -qF 'uc_mem_read((uc_engine *)uc, address, arr, size)' "$SRC"; then
+            echo "$SRC already fixed upstream, nothing to patch"
+          else
+            echo "::error::unexpected shape of _mem_read in $SRC, update this step"
+            exit 1
+          fi
+
       - name: "🚧 Build JNI library"
         working-directory: bindings/java
         shell: bash
